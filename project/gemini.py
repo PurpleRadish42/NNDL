@@ -7,8 +7,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from pytorch_tabnet.tab_model import TabNetClassifier
-import rtdl
+import math
 
 # Set page config
 st.set_page_config(page_title="Fraud Detection with Deep Learning", layout="wide")
@@ -33,6 +35,75 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# --- FT-Transformer Implementation (No rtdl) ---
+class FeatureTokenizer(nn.Module):
+    def __init__(self, n_num_features, d_token):
+        super().__init__()
+        self.d_token = d_token
+        self.weight = nn.Parameter(torch.randn(n_num_features, d_token))
+        self.bias = nn.Parameter(torch.randn(n_num_features, d_token))
+
+    def forward(self, x_num):
+        return x_num[..., None] * self.weight + self.bias
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_token, n_heads, d_ffn, dropout):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_token, n_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_token, d_ffn),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ffn, d_token),
+        )
+        self.norm1 = nn.LayerNorm(d_token)
+        self.norm2 = nn.LayerNorm(d_token)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        attn_output, _ = self.attn(x, x, x, attn_mask=mask)
+        x = x + self.dropout(attn_output)
+        x = self.norm1(x)
+        
+        ffn_output = self.ffn(x)
+        x = x + self.dropout(ffn_output)
+        x = self.norm2(x)
+        return x
+
+class FTTransformer(nn.Module):
+    def __init__(self, n_num_features, d_token, n_blocks, n_heads, d_ffn, dropout, d_out):
+        super().__init__()
+        self.feature_tokenizer = FeatureTokenizer(n_num_features, d_token)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_token))
+        
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlock(d_token, n_heads, d_ffn, dropout) for _ in range(n_blocks)]
+        )
+        
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_token),
+            nn.ReLU(),
+            nn.Linear(d_token, d_out)
+        )
+
+    def forward(self, x_num):
+        x = self.feature_tokenizer(x_num)
+        
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        for block in self.transformer_blocks:
+            x = block(x)
+            
+        # Get the CLS token representation
+        cls_token_output = x[:, 0]
+        
+        # Pass through the head
+        out = self.head(cls_token_output)
+        return out
+
+# --- End of FT-Transformer Implementation ---
 
 @st.cache_data
 def load_data(file):
@@ -86,7 +157,7 @@ def main():
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
         
         X_train_np = X_train.values
-        y_train_np = y_train.values.reshape(-1, 1)
+        y_train_np = y_train.values # Target arrays should be 1D
         X_test_np = X_test.values
         y_test_np = y_test.values
 
@@ -103,7 +174,7 @@ def main():
                     )
                     clf.fit(
                         X_train=X_train_np, y_train=y_train_np,
-                        eval_set=[(X_train_np, y_train_np), (X_test_np, y_test_np.reshape(-1, 1))],
+                        eval_set=[(X_train_np, y_train_np), (X_test_np, y_test_np)],
                         eval_name=['train', 'valid'],
                         eval_metric=['auc'],
                         max_epochs=50, patience=10,
@@ -118,36 +189,43 @@ def main():
 
                 elif model_choice == "FT-Transformer":
                     # FT-Transformer Model
-                    # For simplicity, we'll treat all features as numerical for FT-Transformer in this example
-                    d_out = 1
-                    model = rtdl.FTTransformer.make_default(
+                    model = FTTransformer(
                         n_num_features=X_train_np.shape[1],
-                        cat_cardinalities=None,
-                        last_layer_query_idx=[-1],
-                        d_out=d_out,
+                        d_token=192,
+                        n_blocks=3,
+                        n_heads=8,
+                        d_ffn=768,
+                        dropout=0.1,
+                        d_out=1
                     )
                     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
                     loss_fn = torch.nn.BCEWithLogitsLoss()
+                    
+                    # Create a simple data loader
+                    # Reshape y_train_np to (n_samples, 1) for BCEWithLogitsLoss
+                    train_dataset = torch.utils.data.TensorDataset(
+                        torch.from_numpy(X_train_np).float(), 
+                        torch.from_numpy(y_train_np.reshape(-1, 1)).float()
+                    )
+                    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1024, shuffle=True)
 
                     # Training loop
-                    for epoch in range(200):
+                    for epoch in range(5): # Reduced epochs for faster demo
                         model.train()
-                        optimizer.zero_grad()
-                        x_num = torch.from_numpy(X_train_np).float()
-                        y_true = torch.from_numpy(y_train_np).float()
-                        y_pred_logits = model(x_num, None)
-                        loss = loss_fn(y_pred_logits, y_true)
-                        loss.backward()
-                        optimizer.step()
+                        for x_batch, y_batch in train_loader:
+                            optimizer.zero_grad()
+                            y_pred_logits = model(x_batch)
+                            loss = loss_fn(y_pred_logits, y_batch)
+                            loss.backward()
+                            optimizer.step()
 
                     model.eval()
                     with torch.no_grad():
-                        x_test_num = torch.from_numpy(X_test_np).float()
-                        y_pred_logits = model(x_test_num, None)
+                        x_test_tensor = torch.from_numpy(X_test_np).float()
+                        y_pred_logits = model(x_test_tensor)
                         y_pred_proba = torch.sigmoid(y_pred_logits).numpy().flatten()
                         y_pred = (y_pred_proba > 0.5).astype(int)
                     
-                    # FT-Transformer doesn't have a direct feature importance method like TabNet
                     feature_importances = None
 
 
