@@ -1,5 +1,6 @@
 *.code-workspace
 creditcard.csv
 *.h5
+*.zip
 *.keras
 charts.csv
