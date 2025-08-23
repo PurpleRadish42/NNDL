@@ -944,7 +944,7 @@ class FraudDetectionDashboard:
 
 def main():
     # Main title
-    st.markdown('<div class="main-header">💳 Credit Card Fraud Detection Dashboard</div>', 
+    st.markdown('<div class="main-header"> Credit Card Fraud Detection Dashboard</div>', 
                unsafe_allow_html=True)
     
     # Initialize dashboard
@@ -957,10 +957,11 @@ def main():
     page = st.sidebar.radio(
         "Choose Section:",
         [
+            "ℹ️ About",
             "📊 Dataset Overview",
             "🏆 Model Comparison",
             "🔬 Individual Analysis",
-            "ℹ️ About"
+            
         ]
     )
     
